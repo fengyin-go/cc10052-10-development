@@ -24,11 +24,48 @@ class AnomalyMetricService(BaseModuleService):
 
     # ---- 业务扩展：异常检测与人工处置 ----
 
+    def run_action(self, entry_id: int, action: str, remark: str = "") -> tuple[dict[str, Any] | None, str]:
+        """动作入口统一走领域逻辑：有待处置凭证时经凭证办结，否则校验复核证据。"""
+        if action in ("确认异常", "标记误报"):
+            from app.services import external_review
+
+            entry = store.find(self.MODULE, entry_id)
+            if entry is None:
+                return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
+            pending = self._pending_ticket(entry)
+            if pending is not None:
+                result = external_review.settle_ticket(
+                    str(pending.get("凭证编号")),
+                    decision="confirm" if action == "确认异常" else "close",
+                    remark=remark,
+                )
+                return (entry if result.get("ok") else None), str(result.get("message", ""))
+            if action == "确认异常":
+                result = self.confirm_anomaly(entry_id)
+            else:
+                result = self.mark_false_positive(entry_id, remark or "人工标记误报")
+            return (entry if result.get("ok") else None), str(result.get("message", ""))
+        return super().run_action(entry_id, action, remark)
+
+    def _pending_ticket(self, entry: dict[str, Any]) -> dict[str, Any] | None:
+        from app.services import external_review
+
+        code = entry.get("凭证编号")
+        if not code:
+            return None
+        ticket = external_review.find_ticket(str(code))
+        if ticket is not None and ticket.get("status") == "待处置":
+            return ticket
+        return None
+
     def confirm_anomaly(self, entry_id: int) -> dict[str, Any]:
         """确认异常并把处置单推送到结论评审队列。"""
         entry = store.find(self.MODULE, entry_id)
-        if entry is None or entry.get("status") != "待确认":
+        if entry is None or entry.get("status") not in ("待确认", "待处置"):
             return {"ok": False, "message": "仅待确认异常可确认"}
+        gate = self._require_review_evidence(entry, closing=False)
+        if gate is not None:
+            return gate
         entry["status"] = "已确认"
         entry["pending"] = False
         entry["确认时间"] = datetime.now(timezone.utc).isoformat()
@@ -36,7 +73,7 @@ class AnomalyMetricService(BaseModuleService):
         review_rows.append({
             "id": max((int(r.get("id", 0)) for r in review_rows), default=0) + 1,
             "记录编号": f"RV-AN-{entry_id}",
-            "实验编码": str(entry.get("指标编码", "")).replace("M-", "EXP_-"),
+            "实验编码": str(entry.get("关联实验编码") or entry.get("指标编码", "")).replace("M-", "EXP_-"),
             "评审结论": f"指标异常 {entry.get('异常编号', '')} 待评审处置",
             "评审角色": "数据质量",
             "评审时间": datetime.now(timezone.utc).isoformat(),
@@ -49,10 +86,13 @@ class AnomalyMetricService(BaseModuleService):
     def mark_false_positive(self, entry_id: int, reason: str) -> dict[str, Any]:
         """标记误报并把原因写回数据时效监控修正告警。"""
         entry = store.find(self.MODULE, entry_id)
-        if entry is None or entry.get("status") != "待确认":
+        if entry is None or entry.get("status") not in ("待确认", "待处置"):
             return {"ok": False, "message": "仅待确认异常可标记误报"}
         if not reason.strip():
             return {"ok": False, "message": "标记误报必须填写原因"}
+        gate = self._require_review_evidence(entry, closing=True)
+        if gate is not None:
+            return gate
         entry["status"] = "误报"
         entry["pending"] = False
         entry["abnormal"] = True
@@ -67,6 +107,69 @@ class AnomalyMetricService(BaseModuleService):
                     fresh["时效等级"] = "新鲜"
                     fresh["pending"] = False
         return {"ok": True, "message": f"已标记误报（{reason}），来源告警已修正"}
+
+    def _require_review_evidence(self, entry: dict[str, Any], *, closing: bool) -> dict[str, Any] | None:
+        """确认或关闭异常前必须消费核对文件对应的有效复核证据。
+
+        仅在告警已关联样本量核对文件时启用；与样本偏移无关的普通指标异常保持原流转。
+        """
+        from app.services import external_review
+
+        linked = (
+            str(entry.get("异常编号", "")).startswith("AN-SR")
+            or entry.get("核对文件")
+            or entry.get("核对版次")
+            or entry.get("关联实验编码")
+        )
+        # 复核后仍超阈值时登记的偏移治理任务不是一组新的下载告警，
+        # 它承接的是同一份已办结凭证，按普通异常流转即可。
+        if entry.get("治理来源") or "AN-SR-G" in str(entry.get("异常编号", "")):
+            linked = False
+        if not linked:
+            return None
+        material = external_review.anomaly_material(entry)
+        if not material.get("ok"):
+            return {
+                "ok": False,
+                "message": (
+                    f"异常 {entry.get('异常编号')} 必须先关联样本量核对文件，"
+                    "并在异常处置页领取有效复核凭证后才能办理"
+                ),
+            }
+        tickets = [
+            ticket for ticket in material.get("tickets", [])
+            if ticket.get("status") == "待处置"
+        ]
+        evidence = [
+            item for item in material.get("evidence", [])
+            if item.get("有效")
+        ]
+        if not tickets or not evidence:
+            return {
+                "ok": False,
+                "message": (
+                    f"异常 {entry.get('异常编号')} 缺少有效复核证据，"
+                    "请先在样本量核对登记外部复核并领取处置凭证"
+                ),
+            }
+        ticket = tickets[-1]
+        recomputed = external_review.ticket_recompute(ticket)
+        if closing:
+            threshold = float(ticket.get("阈值", 0.05))
+            # 直接用登记凭证时的口径复算，避免关闭时误采信已过时的下载计数。
+            if float(recomputed["修订偏移量"]) > threshold:
+                return {
+                    "ok": False,
+                    "message": (
+                        f"凭证 {ticket.get('凭证编号')} 的修订计数偏移 "
+                        f"{recomputed['修订偏移量']} 仍超阈值 {threshold}，不能关闭告警"
+                    ),
+                }
+            entry["处置时修订偏移"] = recomputed["修订偏移量"]
+        entry["处置凭证"] = ticket.get("凭证编号")
+        entry["处置证据"] = ticket.get("证据编号")
+        entry["处置采用的计数口径"] = ticket.get("采用计数口径")
+        return None
 
     def detect_deviation(self, metric_code: str, observed: float, baseline: float) -> dict[str, Any]:
         """对比观测值与基线，偏差超阈值时登记新异常事件。"""

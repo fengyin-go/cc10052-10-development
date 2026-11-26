@@ -64,7 +64,7 @@ npm run dev
 | 数据时效监控 | `data_freshness` | 时效记录 | 监控对象、数据域、最新水位 |
 | 指标异常检测 | `anomaly_metric` | 异常事件 | 异常编号、指标编码、基线区间 |
 | 实验归档库 | `exp_archive` | 归档实验 | 实验编码、结束时间、结论摘要 |
-| 样本量核对 | `sample_ratio` | 核对结果 | 核对批次、实验编码、计划比例 |
+| 样本量核对 | `sample_ratio` | 核对结果 | 核对批次、实验编码、核对版次、计划比例、阈值 |
 | AA预检器 | `aa_check` | AA检验 | 检验编码、实验编码、检验窗口 |
 | 切片分析器 | `segment_slice` | 切片结果 | 切片批次、实验编码、切片维度 |
 | 曝光日志接入 | `exposure_log` | 曝光记录 | 日志批次、实验编码、用户标识 |
@@ -78,6 +78,24 @@ npm run dev
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+- 样本量核对的外部复核走 `app/services/external_review.py` 与 `/api/review/*`：
+  按核对版次冻结下载文件（二次下载不再改写），登记更正证据时校验实验、版次、
+  两组计数与分子并留存错误原始行，异常确认/关闭必须领取对应的有效复核证据。
+  台账放在 `aux_` 前缀辅助表，不计入业务模块清单。
+
+### 外部复核接口
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| GET | `/api/review/tasks/{核对记录ID}` | 核对详情：可选轮次、已冻结文件、可用于后续处置的版本 |
+| POST | `/api/review/tasks/{核对记录ID}/downloads` | 按核对版次冻结并生成下载文件 |
+| GET | `/api/review/files/{文件编号}/downloads` | 下载冻结文件（内容不随计划调整变化） |
+| POST | `/api/review/files/{文件编号}/evidence` | 外部更正登记：缺组别/分子超总量时报错并留原始行 |
+| GET | `/api/review/evidence/{证据编号}/signed` | 独立留档的原签收 |
+| POST | `/api/review/evidence/{证据编号}/claim` | 登记签收并领取处置凭证 |
+| GET | `/api/review/anomalies/{异常ID}` | 异常检测页打开凭证与两套计数口径 |
+| POST | `/api/review/tickets/{凭证编号}/settle` | 办结：采用哪套计数口径、是否启动偏移治理 |
+| GET | `/api/review/records/{凭证或异常编号}` | 异常处置记录：所用样本计数、计划比例与阈值 |
 
 领域：数据工程
 子方向：数据分析与数据应用

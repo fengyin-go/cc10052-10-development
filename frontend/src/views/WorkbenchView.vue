@@ -60,6 +60,15 @@
             >
               {{ action }}
             </button>
+            <button
+              v-if="hasReview"
+              class="link"
+              type="button"
+              :data-testid="`review-${row.id}`"
+              @click="openReview(row)"
+            >
+              {{ meta.key === 'sample_ratio' ? '外部复核' : '凭证处置' }}
+            </button>
           </td>
         </tr>
         <tr v-if="!rows.length">
@@ -86,6 +95,12 @@
       </form>
     </div>
 
+    <ReviewPanels
+      v-if="hasReview && reviewRow"
+      :mode="meta.key as 'sample_ratio' | 'anomaly_metric'"
+      :row="reviewRow"
+    />
+
     <footer class="page-foot">
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
@@ -103,10 +118,12 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
+import ReviewPanels from '@/views/ReviewPanels.vue'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
+const hasReview = ['sample_ratio', 'anomaly_metric'].includes(meta.key)
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
@@ -115,6 +132,10 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const reviewRow = ref<EntryRow | null>(null)
+function openReview(row: EntryRow) {
+  reviewRow.value = row
+}
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
   { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
@@ -182,6 +203,10 @@ async function reload() {
     const payload = await listEntries(meta.key, filters.value)
     rows.value = payload.items
     total.value = payload.total
+    if (reviewRow.value) {
+      reviewRow.value =
+        payload.items.find((item) => Number(item.id) === Number(reviewRow.value?.id)) ?? null
+    }
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '业务列表读取失败'
   }

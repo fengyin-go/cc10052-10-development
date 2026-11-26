@@ -16,7 +16,9 @@ class Store:
         }
 
     def module_names(self) -> list[str]:
-        return sorted(self._tables)
+        # 外部复核台账等跨模块辅助表以 aux_ 开头，只供领域服务内部引用，
+        # 不计入业务模块清单与运营概览。
+        return sorted(name for name in self._tables if not name.startswith("aux_"))
 
     def rows(self, module: str) -> list[dict[str, Any]]:
         return self._tables.setdefault(module, [])
